@@ -10,9 +10,9 @@ from typing import NoReturn
 import requests
 import tiktoken
 
-from .utils import create_completer
-from .utils import create_session
-from .utils import get_input
+from utils import create_completer
+from utils import create_session
+from utils import get_input
 
 ENGINE = os.environ.get("GPT_ENGINE") or "gpt-3.5-turbo"
 
@@ -34,11 +34,13 @@ class Chatbot:
         frequency_penalty: float = 0.0,
         reply_count: int = 1,
         system_prompt: str = "You are ChatGPT, a large language model trained by OpenAI. Respond conversationally",
+        current_convo_id: str = "default",
     ) -> None:
         """
         Initialize Chatbot with API key (from https://platform.openai.com/account/api-keys)
         """
         self.engine = engine or ENGINE
+        self.current_convo_id = current_convo_id
         self.session = requests.Session()
         self.api_key = api_key
         self.proxy = proxy
@@ -48,8 +50,8 @@ class Chatbot:
                 "https": self.proxy,
             }
             self.session.proxies = proxies
-        self.conversation: dict = {
-            "default": [
+        self.conversation: dict[str, list] = {
+            current_convo_id: [
                 {
                     "role": "system",
                     "content": system_prompt,
@@ -64,36 +66,66 @@ class Chatbot:
         self.frequency_penalty = frequency_penalty
         self.reply_count = reply_count
 
-        if self.get_token_count("default") > self.max_tokens:
+        if self.get_token_count() > self.max_tokens:
             raise Exception("System prompt is too long")
+
+    def in_convo(self, *convo_ids : str, callback: callable = None) -> any:
+        """
+        Do something in a conversation, then reset to the previous conversation
+        """
+        # check if convo_ids is a subset of self.conversation.keys()
+        if not set(convo_ids).issubset(self.conversation.keys()):
+            raise Exception("Invalid conversation ID")
+
+        prev_convo_id = self.current_convo_id
+        self.current_convo_id = convo_ids
+        try:
+            if callback:
+                return callback()
+        finally:
+            self.current_convo_id = prev_convo_id
+
+    def get_conversation(self, *convo_ids : str) -> list:
+        """
+        Get conversation
+        """
+        if not convo_ids:
+            # return dict of conversations that match the key in convo_ids
+            return {k: v for k, v in self.conversation.items() if k in convo_ids}
+            
+        # check if convo_ids is a subset of self.conversation.keys()
+        if not set(convo_ids).issubset(self.conversation.keys()):
+            raise Exception("Invalid conversation ID")
+        return self.conversation[convo_ids]
 
     def add_to_conversation(
         self,
         message: str,
         role: str,
-        convo_id: str = "default",
     ) -> None:
         """
         Add a message to the conversation
         """
-        self.conversation[convo_id].append({"role": role, "content": message})
+        self.conversation[self.current_convo_id].append(
+            {"role": role, "content": message}
+        )
 
-    def __truncate_conversation(self, convo_id: str = "default") -> None:
+    def __truncate_conversation(self) -> None:
         """
         Truncate the conversation
         """
         while True:
             if (
-                self.get_token_count(convo_id) > self.max_tokens
-                and len(self.conversation[convo_id]) > 1
+                self.get_token_count() > self.max_tokens
+                and len(self.conversation[self.current_convo_id]) > 1
             ):
                 # Don't remove the first message
-                self.conversation[convo_id].pop(1)
+                self.conversation[self.current_convo_id].pop(1)
             else:
                 break
 
     # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-    def get_token_count(self, convo_id: str = "default") -> int:
+    def get_token_count(self) -> int:
         """
         Get token count
         """
@@ -103,7 +135,7 @@ class Chatbot:
         encoding = tiktoken.encoding_for_model(self.engine)
 
         num_tokens = 0
-        for message in self.conversation[convo_id]:
+        for message in self.conversation[self.current_convo_id]:
             # every message follows <im_start>{role/name}\n{content}<im_end>\n
             num_tokens += 4
             for key, value in message.items():
@@ -113,34 +145,33 @@ class Chatbot:
         num_tokens += 2  # every reply is primed with <im_start>assistant
         return num_tokens
 
-    def get_max_tokens(self, convo_id: str) -> int:
+    def get_max_tokens(self) -> int:
         """
         Get max tokens
         """
-        return 4000 - self.get_token_count(convo_id)
+        return 4000 - self.get_token_count()
 
     def ask_stream(
         self,
         prompt: str,
         role: str = "user",
-        convo_id: str = "default",
         **kwargs,
     ) -> str:
         """
         Ask a question
         """
         # Make conversation if it doesn't exist
-        if convo_id not in self.conversation:
-            self.reset(convo_id=convo_id, system_prompt=self.system_prompt)
-        self.add_to_conversation(prompt, "user", convo_id=convo_id)
-        self.__truncate_conversation(convo_id=convo_id)
+        if self.current_convo_id not in self.conversation:
+            self.reset(system_prompt=self.system_prompt)
+        self.add_to_conversation(prompt, "user")
+        self.__truncate_conversation()
         # Get response
         response = self.session.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {kwargs.get('api_key', self.api_key)}"},
             json={
                 "model": self.engine,
-                "messages": self.conversation[convo_id],
+                "messages": self.conversation[self.current_convo_id],
                 "stream": True,
                 # kwargs
                 "temperature": kwargs.get("temperature", self.temperature),
@@ -179,13 +210,12 @@ class Chatbot:
                 content = delta["content"]
                 full_response += content
                 yield content
-        self.add_to_conversation(full_response, response_role, convo_id=convo_id)
+        self.add_to_conversation(full_response, response_role)
 
     def ask(
         self,
         prompt: str,
         role: str = "user",
-        convo_id: str = "default",
         **kwargs,
     ) -> str:
         """
@@ -194,24 +224,23 @@ class Chatbot:
         response = self.ask_stream(
             prompt=prompt,
             role=role,
-            convo_id=convo_id,
             **kwargs,
         )
         full_response: str = "".join(response)
         return full_response
 
-    def rollback(self, n: int = 1, convo_id: str = "default") -> None:
+    def rollback(self, n: int = 1) -> None:
         """
         Rollback the conversation
         """
         for _ in range(n):
-            self.conversation[convo_id].pop()
+            self.conversation[self.current_convo_id].pop()
 
-    def reset(self, convo_id: str = "default", system_prompt: str = None) -> None:
+    def reset(self, system_prompt: str = None) -> None:
         """
         Reset the conversation
         """
-        self.conversation[convo_id] = [
+        self.conversation[self.current_convo_id] = [
             {"role": "system", "content": system_prompt or self.system_prompt},
         ]
 
@@ -247,16 +276,16 @@ class Chatbot:
 
 
 class ChatbotCLI(Chatbot):
-    def print_config(self, convo_id: str = "default") -> None:
+    def print_config(self) -> None:
         """
         Prints the current configuration
         """
         print(
             f"""
 ChatGPT Configuration:
-  Conversation ID:  {convo_id}
-  Messages:         {len(self.conversation[convo_id])}
-  Tokens used:      {( num_tokens := self.get_token_count(convo_id) )} / {self.max_tokens}
+  Conversation ID:  {self.current_convo_id}
+  Messages:         {len(self.conversation[self.current_convo_id])}
+  Tokens used:      {( num_tokens := self.get_token_count() )} / {self.max_tokens}
   Cost:             {"${:.5f}".format(( num_tokens / 1000 ) * 0.002)}
   Engine:           {self.engine}
   Temperature:      {self.temperature}
@@ -288,7 +317,7 @@ Config Commands:
   """,
         )
 
-    def handle_commands(self, input: str, convo_id: str = "default") -> bool:
+    def handle_commands(self, input: str) -> bool:
         """
         Handle chatbot commands
         """
@@ -298,12 +327,12 @@ Config Commands:
         elif command == "!exit":
             sys.exit()
         elif command == "!reset":
-            self.reset(convo_id=convo_id)
+            self.reset()
             print("\nConversation has been reset")
         elif command == "!config":
-            self.print_config(convo_id=convo_id)
+            self.print_config()
         elif command == "!rollback":
-            self.rollback(int(value[0]), convo_id=convo_id)
+            self.rollback(int(value[0]))
             print(f"\nRolled back by {value[0]} messages")
         elif command == "!save":
             if is_saved := self.save(*value):
@@ -448,11 +477,14 @@ def main() -> NoReturn:
         print()
         print("ChatGPT: ", flush=True)
         if args.enable_internet:
-            query = chatbot.ask(
-                f'This is a prompt from a user to a chatbot: "{prompt}". Respond with "none" if it is directed at the chatbot or cannot be answered by an internet search. Otherwise, respond with a possible search query to a search engine. Do not write any additional text. Make it as minimal as possible',
-                convo_id="search",
-                temperature=0.0,
-            ).strip()
+            query = chatbot.in_convo(
+                "search",
+                lambda : chatbot.ask(
+                    f'This is a prompt from a user to a chatbot: "{prompt}". Respond with "none" if it is directed at the chatbot or cannot be answered by an internet search. Otherwise, respond with a possible search query to a search engine. Do not write any additional text. Make it as minimal as possible',
+                    temperature=0.0,
+                ).strip(),
+            )
+
             print("Searching for: ", query, "")
             # Get search results
             search_results = (
@@ -465,13 +497,9 @@ def main() -> NoReturn:
                 ).text
             )
             print(json.dumps(json.loads(search_results), indent=4))
-            chatbot.add_to_conversation(
-                f"Search results:{search_results}",
-                "system",
-                convo_id="default",
-            )
+            chatbot.add_to_conversation(f"Search results:{search_results}", "system")
             if args.no_stream:
-                print(chatbot.ask(prompt, "user", convo_id="default"))
+                print(chatbot.ask(prompt, "user"))
             else:
                 for query in chatbot.ask_stream(prompt):
                     print(query, end="", flush=True)
