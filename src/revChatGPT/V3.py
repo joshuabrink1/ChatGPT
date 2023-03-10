@@ -357,27 +357,15 @@ Config Commands:
             self.rollback(int(value[0]), convo_id=convo_id)
             print(f"\nRolled back by {value[0]} messages")
         elif command == "!save":
-            if is_saved := self.save(*value):
-                convo_ids = value[1:] or self.conversation.keys()
-                print(
-                    f"Saved conversation{'s' if len(convo_ids) > 1 else ''} {', '.join(convo_ids)} to {value[0]}",
-                )
-            else:
-                print(f"Error: {value[0]} could not be created")
-
+            self.save(*value)
+            print(
+                f"Saved {', '.join(value[1:]) if len(value) > 1 else 'all'} keys to {value[0]}"
+            )
         elif command == "!load":
-            if is_loaded := self.load(*value):
-                convo_ids = value[1:] or self.conversation.keys()
-                print(
-                    f"Loaded conversation{'s' if len(convo_ids) > 1 else ''} {', '.join(convo_ids)} from {value[0]}",
-                )
-            else:
-                print(f"Error: {value[0]} could not be loaded")
-        elif command == "!load_config":
-            if is_loaded := self.load_config(*value):
-                print(f"Loaded config from {value[0]}")
-            else:
-                print(f"Error: {value[0]} could not be loaded")
+            self.load(*value)
+            print(
+                f"Loaded {', '.join(value[1:]) if len(value) > 1 else 'all'} keys from {value[0]}"
+            )
         elif command == "!temperature":
             self.temperature = float(value[0])
             print(f"\nTemperature set to {value[0]}")
@@ -533,7 +521,11 @@ def main() -> NoReturn:
         except KeyboardInterrupt:
             print("\nExiting...")
             sys.exit()
-        if prompt.startswith("!") and chatbot.handle_commands(prompt):
+        if prompt.startswith("!"):
+            try:
+                chatbot.handle_commands(prompt)
+            except Exception as e:
+                print(f"Error: {e}")
             continue
         print()
         print("ChatGPT: ", flush=True)
